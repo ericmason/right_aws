@@ -210,7 +210,7 @@ module RightAws
       def keys(options={}, head=false)
         keys_and_service(options, head)[0]
       end
-
+      
         # Same as +keys+ method but return an array of [keys, service_data]. 
         # where +service_data+ is a hash with additional output information.
         #
@@ -224,8 +224,13 @@ module RightAws
         list = []
         @s3.interface.incrementally_list_bucket(@name, opt) do |thislist|
           thislist[:contents].each do |entry|
+            p entry
             owner = Owner.new(entry[:owner_id], entry[:owner_display_name])
-            key = Key.new(self, entry[:key], nil, {}, {}, entry[:last_modified], entry[:e_tag], entry[:size], entry[:storage_class], owner)
+            if entry[:version_id]
+              key = KeyVersion.new(self, entry[:key], nil, {}, {}, entry[:last_modified], entry[:e_tag], entry[:size], entry[:storage_class], owner, entry[:version_id])
+            else
+              key = Key.new(self, entry[:key], nil, {}, {}, entry[:last_modified], entry[:e_tag], entry[:size], entry[:storage_class], owner)
+            end
             key.head if head
             list << key
           end
@@ -659,7 +664,15 @@ module RightAws
       
     end
     
-
+    class KeyVersion < Key
+      attr_reader :version_id
+      def initialize(bucket, name, data=nil, headers={}, meta_headers={}, 
+                     last_modified=nil, e_tag=nil, size=nil, storage_class=nil, owner=nil, version_id=nil)
+        super(bucket, name, data, headers, meta_headers, last_modified, e_tag, size, storage_class, owner)
+        @version_id = version_id
+      end
+    end
+    
     class Owner
       attr_reader :id, :name
       

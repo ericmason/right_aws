@@ -114,6 +114,8 @@ module RightAws
       out_string << '?torrent'  if path[/[&?]torrent($|&|=)/]
       out_string << '?location' if path[/[&?]location($|&|=)/]
       out_string << '?logging'  if path[/[&?]logging($|&|=)/]  # this one is beta, no support for now
+      out_string << '?versions' if path[/[&?]versions($|&|=)/] 
+      out_string << '?versioning' if path[/[&?]versioning($|&|=)/] 
       out_string
     end
 
@@ -238,6 +240,24 @@ module RightAws
       on_exception
     end
     
+    # Retrieves the versioning configuration for a bucket. 
+      # Returns a hash of {:enabled, :targetbucket, :targetprefix}
+      # 
+      # s3.interface.get_logging_parse(:bucket => "asset_bucket")
+      #   => {:enabled=>true, :targetbucket=>"myversionedbucket", :targetprefix=>"loggylogs/"}
+      #
+      #  
+    def get_versioning_parse(params)
+      AwsUtils.mandatory_arguments([:bucket], params)
+      AwsUtils.allow_only([:bucket, :headers], params)
+      params[:headers] = {} unless params[:headers]
+      req_hash = generate_rest_request('GET', params[:headers].merge(:url=>"#{params[:bucket]}?versioning"))
+      request_info(req_hash, S3VersioningParser.new)
+    rescue
+      on_exception
+    end
+    
+    
     # Retrieves the logging configuration for a bucket. 
       # Returns a hash of {:enabled, :targetbucket, :targetprefix}
       # 
@@ -299,13 +319,21 @@ module RightAws
       #                  'max-keys'     => "5"}, ..., {...}]
       #
     def list_bucket(bucket, options={}, headers={})
-      bucket  += '?'+options.map{|k, v| "#{k.to_s}=#{CGI::escape v.to_s}"}.join('&') unless options.right_blank?
+      versions = options.delete(:versions) ? 'versions&' : ''
+      bucket  += '?'+versions+options.map{|k, v| "#{k.to_s}=#{CGI::escape v.to_s}"}.join('&') unless options.right_blank?
       req_hash = generate_rest_request('GET', headers.merge(:url=>bucket))
       request_info(req_hash, S3ListBucketParser.new(:logger => @logger))
     rescue
       on_exception
     end
 
+    def list_bucket_versions(bucket, options={}, headers={})
+      bucket  += '?versions&'+options.map{|k, v| "#{k.to_s}=#{CGI::escape v.to_s}"}.join('&') unless options.right_blank?
+      req_hash = generate_rest_request('GET', headers.merge(:url=>bucket))
+      request_info(req_hash, S3ListBucketParser.new(:logger => @logger))
+    rescue
+      on_exception
+    end
     # Incrementally list the contents of a bucket. Yields the following hash to a block:
     #  s3.incrementally_list_bucket('my_awesome_bucket', { 'prefix'=>'t', 'marker'=>'', 'max-keys'=>5, delimiter=>'' }) yields  
     #   {
@@ -337,7 +365,8 @@ module RightAws
       internal_options = options.right_symbolize_keys
       begin 
         internal_bucket = bucket.dup
-        internal_bucket  += '?'+internal_options.map{|k, v| "#{k.to_s}=#{CGI::escape v.to_s}"}.join('&') unless internal_options.right_blank?
+        versions = options.delete(:versions) ? 'versions&' : ''
+        internal_bucket  += '?'+versions+internal_options.map{|k, v| "#{k.to_s}=#{CGI::escape v.to_s}"}.join('&') unless internal_options.right_blank?
         req_hash = generate_rest_request('GET', headers.merge(:url=>internal_bucket))
         response = request_info(req_hash, S3ImprovedListBucketParser.new(:logger => @logger))
         there_are_more_keys = response[:is_truncated]
@@ -1013,7 +1042,7 @@ module RightAws
         @current_key = {}
       end
       def tagstart(name, attributes)
-        @current_key = {} if name == 'Contents'
+        @current_key = {} if name == 'Contents' || name == 'Version'
       end
       def tagend(name)
         case name
@@ -1032,6 +1061,10 @@ module RightAws
           when 'StorageClass'then @current_key[:storage_class]      = @text
           when 'ID'          then @current_key[:owner_id]           = @text
           when 'DisplayName' then @current_key[:owner_display_name] = @text
+          when 'VersionId'   then @current_key[:version_id]         = @text
+          when 'Version'
+            @current_key[:service] = @service
+            result << @current_key
           when 'Contents'
             @current_key[:service] = @service
             @result << @current_key
@@ -1050,7 +1083,7 @@ module RightAws
         @in_common_prefixes = false
       end
       def tagstart(name, attributes)
-        @current_key = {} if name == 'Contents'
+        @current_key = {} if name == 'Contents' || name == 'Version'
         @in_common_prefixes = true if name == 'CommonPrefixes'
       end
       def tagend(name)
@@ -1074,7 +1107,9 @@ module RightAws
           when 'StorageClass'then @current_key[:storage_class]      = @text
           when 'ID'          then @current_key[:owner_id]           = @text
           when 'DisplayName' then @current_key[:owner_display_name] = @text
+          when 'VersionId'   then @current_key[:version_id]         = @text
           when 'Contents'    then @result[:contents] << @current_key
+          when 'Version'     then @result[:contents] << @current_key
             # Common Prefix stuff
           when 'CommonPrefixes' 
             @result[:common_prefixes] = @common_prefixes
@@ -1124,7 +1159,19 @@ module RightAws
         end
       end
     end
-    
+
+    class S3VersioningParser < RightAWSParser  # :nodoc:
+      def reset
+        @result          = {:enabled => false}
+        @current_grantee = {}
+      end
+      def tagend(name)
+        if name == 'Status'
+          result[:enabled] = true if @text == 'Enabled'
+        end
+      end
+    end    
+
     class S3LoggingParser < RightAWSParser  # :nodoc:
       def reset
         @result          = {:enabled => false, :targetbucket => '', :targetprefix => ''}
