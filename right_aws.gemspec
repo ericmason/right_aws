@@ -34,7 +34,7 @@ Gem::Specification.new do |spec|
   spec.has_rdoc = true
   spec.rdoc_options = ['--main', 'README.txt', '--title', '']
   spec.extra_rdoc_files = ['README.txt']
-  spec.required_ruby_version = '>= 1.8.7'
+  spec.required_ruby_version = '>= 1.8.6'
   spec.require_path = 'lib'
 
   spec.add_dependency('right_http_connection', '>= 1.2.5')

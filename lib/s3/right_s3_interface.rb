@@ -256,6 +256,20 @@ module RightAws
     rescue
       on_exception
     end
+
+    # Sets versioning configuration for a bucket from the XML configuration document.
+    #   params:
+    #    :bucket
+    #    :xmldoc
+    def put_versioning(params)  
+      AwsUtils.mandatory_arguments([:bucket,:xmldoc], params)
+      AwsUtils.allow_only([:bucket,:xmldoc, :headers], params)
+      params[:headers] = {} unless params[:headers]
+      req_hash = generate_rest_request('PUT', params[:headers].merge(:url=>"#{params[:bucket]}?versioning", :data => params[:xmldoc]))
+      request_info(req_hash, RightHttp2xxParser.new)
+    rescue
+      on_exception
+    end
     
     
     # Retrieves the logging configuration for a bucket. 

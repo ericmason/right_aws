@@ -199,6 +199,19 @@ module RightAws
         @s3.interface.put_logging(:bucket => @name, :xmldoc => xmldoc)
       end
 
+
+      # Enables S3 versioning on a bucket.  Takes no arguments.
+      def enable_versioning
+        xmldoc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Enabled</Status></VersioningConfiguration>"
+        @s3.interface.put_versioning(:bucket => @name, :xmldoc => xmldoc)
+      end
+
+      # Disables S3 versioning on a bucket.   Takes no arguments.
+      def disable_versioning
+        xmldoc = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>Suspended</Status></VersioningConfiguration>"
+        @s3.interface.put_versioning(:bucket => @name, :xmldoc => xmldoc)
+      end
+
         # Retrieve a group of keys from Amazon. 
         # +options+ is a hash: { 'prefix'=>'', 'marker'=>'', 'max-keys'=>5, 'delimiter'=>'' }). 
         # Retrieves meta-headers information if +head+ it +true+. 
