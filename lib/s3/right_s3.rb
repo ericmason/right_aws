@@ -97,10 +97,24 @@ module RightAws
     #  (section: Canned Access Policies)
     #
     def bucket(name, create=false, perms=nil, headers={})
-      headers['x-amz-acl'] = perms if perms
-      @interface.create_bucket(name, headers) if create
-      buckets.each { |bucket| return bucket if bucket.name == name }
-      nil
+      result = nil
+      if create
+        headers['x-amz-acl'] = perms if perms
+        @interface.create_bucket(name, headers) 
+      end
+      begin
+        buckets.each do |bucket| 
+          if bucket.name == name 
+            result = bucket
+            break
+          end
+        end
+      rescue RightAws::AwsError => e
+        # With non root creds one can use bucket(s) but can't list them
+        raise e unless e.message['AccessDenied']
+        result = Bucket::new(self, name)
+      end
+      result
     end
     
 
@@ -233,11 +247,11 @@ module RightAws
         #
       def keys_and_service(options={}, head=false)
         opt = {}; options.each{ |key, value| opt[key.to_s] = value }
-        thislist = {}
-        list = []
-        @s3.interface.incrementally_list_bucket(@name, opt) do |thislist|
-          thislist[:contents].each do |entry|
-            p entry
+        service = {}
+        keys = []
+        @s3.interface.incrementally_list_bucket(@name, opt) do |_service|
+          service = _service
+          service[:contents].each do |entry|
             owner = Owner.new(entry[:owner_id], entry[:owner_display_name])
             if entry[:version_id]
               key = KeyVersion.new(self, entry[:key], nil, {}, {}, entry[:last_modified], entry[:e_tag], entry[:size], entry[:storage_class], owner, entry[:version_id])
@@ -245,11 +259,11 @@ module RightAws
               key = Key.new(self, entry[:key], nil, {}, {}, entry[:last_modified], entry[:e_tag], entry[:size], entry[:storage_class], owner)
             end
             key.head if head
-            list << key
+            keys << key
           end
         end
-        thislist.delete(:contents)
-        [list, thislist]
+        service.delete(:contents)
+        [keys, service]
       end
 
         # Retrieve key information from Amazon. 
@@ -262,11 +276,12 @@ module RightAws
         #  key = RightAws::S3::Key.create(bucket, 'logs/today/1.log')
         #  key.head
         #
-      def key(key_name, head=false)
+      def key(key_name, head=false, &blck)
         raise 'Key name can not be empty.' if key_name.right_blank?
         key_instance = nil
           # if this key exists - find it ....
         keys({'prefix'=>key_name}, head).each do |key|
+          blck.call if block_given?
           if key.name == key_name.to_s
             key_instance = key
             break
@@ -285,17 +300,17 @@ module RightAws
         #
         #  bucket.put('logs/today/1.log', 'Olala!') #=> true
         #
-      def put(key, data=nil, meta_headers={}, perms=nil, headers={})
+      def put(key, data=nil, meta_headers={}, perms=nil, headers={}, &blck)
         key = Key.create(self, key.to_s, data, meta_headers) unless key.is_a?(Key) 
-        key.put(data, perms, headers)
+        key.put(data, perms, headers, &blck)
       end
 
-        # Retrieve object data from Amazon. 
+        # Retrieve data object from Amazon. 
         # The +key+ is a +String+ or Key. 
-        # Returns Key instance. 
+        # Returns String instance. 
         #
-        #  key = bucket.get('logs/today/1.log') #=> 
-        #  puts key.data #=> 'sasfasfasdf'
+        #  data = bucket.get('logs/today/1.log') #=> 
+        #  puts data #=> 'sasfasfasdf'
         #
       def get(key, headers={})
         key = Key.create(self, key.to_s) unless key.is_a?(Key)
@@ -521,11 +536,33 @@ module RightAws
         #   ...
         #  key.put('Olala!')   #=> true
         #
-      def put(data=nil, perms=nil, headers={})
+      def put(data=nil, perms=nil, headers={}, &blck)
         headers['x-amz-acl'] = perms if perms
         @data = data || @data
         meta  = self.class.add_meta_prefix(@meta_headers)
-        @bucket.s3.interface.put(@bucket.name, @name, @data, meta.merge(headers))
+        @bucket.s3.interface.put(@bucket.name, @name, @data, meta.merge(headers), &blck)
+      end
+
+        # Store object data on S3 using the Multipart Upload API. This is useful if you do not know the file size
+        # upfront (for example reading from pipe or socket) or if you are transmitting data over an unreliable network.
+        #
+        # Parameter +data+ is an object which responds to :read or an object which can be converted to a String prior to upload.
+        # Parameter +part_size+ determines the size of each part sent (must be > 5MB per Amazon's API requirements)
+        #
+        # If data is a stream the caller is responsible for calling close() on the stream after this methods returns
+        #
+        # Returns +true+.
+        #
+        #  upload_data = StringIO.new('My sample data')
+        #  key = RightAws::S3::Key.create(bucket, 'logs/today/1.log')
+        #  key.data = upload_data
+        #  key.put_multipart(:part_size => 5*1024*1024)             #=> true
+        #
+      def put_multipart(data=nil, perms=nil, headers={}, part_size=nil)
+        headers['x-amz-acl'] = perms if perms
+        @data = data || @data
+        meta  = self.class.add_meta_prefix(@meta_headers)
+        @bucket.s3.interface.store_object_multipart({:bucket => @bucket.name, :key => @name, :data => @data, :headers => meta.merge(headers), :part_size => part_size})
       end
       
         # Rename an object. Returns new object name.
@@ -1067,8 +1104,8 @@ module RightAws
         #
         #  bucket.get('logs/today/1.log', 1.hour)
         #
-      def get(key, expires=nil, headers={})
-        @s3.interface.get_link(@name, key.to_s, expires, headers)
+      def get(key, expires=nil, headers={}, response_params={})
+        @s3.interface.get_link(@name, key.to_s, expires, headers, response_params)
       end
        
         # Generate link to delete bucket. 
@@ -1124,8 +1161,8 @@ module RightAws
         #
         #  bucket.get('logs/today/1.log', 1.hour) #=> https://s3.amazonaws.com:443/my_awesome_bucket/logs%2Ftoday%2F1.log?Signature=h...M%3D&Expires=1180820032&AWSAccessKeyId=1...2
         #
-      def get(expires=nil, headers={})
-        @bucket.s3.interface.get_link(@bucket.to_s, @name, expires, headers)
+      def get(expires=nil, headers={}, response_params={})
+        @bucket.s3.interface.get_link(@bucket.to_s, @name, expires, headers, response_params)
       end
        
         # Generate link to delete key. 

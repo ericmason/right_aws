@@ -24,7 +24,6 @@
 # Test
 module RightAws
   require 'digest/md5'
-  require 'pp'
   
   class AwsUtils #:nodoc:
     @@digest1   = OpenSSL::Digest::Digest.new("sha1")
@@ -44,9 +43,15 @@ module RightAws
       Base64.encode64(OpenSSL::HMAC.digest(@@digest1, aws_secret_access_key, auth_string)).strip
     end
 
+    # Calculates 'Content-MD5' header value for some content
+    def self.content_md5(content)
+      Base64.encode64(Digest::MD5::new.update(content).digest).strip
+    end
+
     # Escape a string accordingly Amazon rulles
     # http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/index.html?REST_RESTAuth.html
     def self.amz_escape(param)
+      param = param.flatten.join('') if param.is_a?(Array) # ruby 1.9.x Array#to_s fix
       param.to_s.gsub(/([^a-zA-Z0-9._~-]+)/n) do
         '%' + $1.unpack('H2' * $1.size).join('%').upcase
       end
@@ -65,6 +70,16 @@ module RightAws
       service_hash["Timestamp"] ||= utc_iso8601(Time.now) unless service_hash["Expires"]
       service_hash["SignatureVersion"] = signature
       service_hash
+    end
+
+    def self.fix_headers(headers)
+      result = {}
+      headers.each do |header, value|
+        next if !header.is_a?(String) || value.nil?
+        header = header.downcase
+        result[header] = value if result[header].right_blank?
+      end
+      result
     end
 
     # Signature Version 0
@@ -274,20 +289,26 @@ module RightAws
       @aws_secret_access_key = aws_secret_access_key
       # if the endpoint was explicitly defined - then use it
       if @params[:endpoint_url]
-        @params[:server]   = URI.parse(@params[:endpoint_url]).host
-        @params[:port]     = URI.parse(@params[:endpoint_url]).port
-        @params[:service]  = URI.parse(@params[:endpoint_url]).path
+        uri = URI.parse(@params[:endpoint_url])
+        @params[:server]   = uri.host
+        @params[:port]     = uri.port
+        @params[:service]  = uri.path
+        @params[:protocol] = uri.scheme
         # make sure the 'service' path is not empty
         @params[:service]  = service_info[:default_service] if @params[:service].right_blank?
-        @params[:protocol] = URI.parse(@params[:endpoint_url]).scheme
         @params[:region]   = nil
+        default_port       = uri.default_port
       else
         @params[:server]   ||= service_info[:default_host]
         @params[:server]     = "#{@params[:region]}.#{@params[:server]}" if @params[:region]
         @params[:port]     ||= service_info[:default_port]
         @params[:service]  ||= service_info[:default_service]
         @params[:protocol] ||= service_info[:default_protocol]
+        default_port         = @params[:protocol] == 'https' ? 443 : 80
       end
+      # build a host name to sign
+      @params[:host_to_sign]  = @params[:server].dup
+      @params[:host_to_sign] << ":#{@params[:port]}" unless default_port == @params[:port].to_i
       # a set of options to be passed to RightHttpConnection object
       @params[:connection_options] = {} unless @params[:connection_options].is_a?(Hash) 
       @with_connection_options = {}
@@ -331,7 +352,8 @@ module RightAws
         # get rid of requestId (this bad boy was added for API 2008-08-08+ and it is uniq for every response)
         # feb 04, 2009 (load balancer uses 'RequestId' hence use 'i' modifier to hit it also)
         response = response.sub(%r{<requestId>.+?</requestId>}i, '')
-        response_md5 = MD5.md5(response).to_s
+        # this should work for both ruby 1.8.x and 1.9.x
+        response_md5 = Digest::MD5::new.update(response).to_s
         # check for changes
         unless @cache[function] && @cache[function][:response_md5] == response_md5
           # well, the response is new, reset cache data
@@ -416,7 +438,7 @@ module RightAws
 
     # ACF, AMS, EC2, LBS and SDB uses this guy
     # SQS and S3 use their own methods
-    def generate_request_impl(verb, action, options={}) #:nodoc:
+    def generate_request_impl(verb, action, options={}, custom_options={}) #:nodoc:
       # Form a valid http verb: 'GET' or 'POST' (all the other are not supported now)
       http_verb = verb.to_s.upcase
       # remove empty keys from request options
@@ -424,16 +446,17 @@ module RightAws
       # prepare service data
       service_hash = {"Action"         => action,
                       "AWSAccessKeyId" => @aws_access_key_id,
-                      "Version"        => @params[:api_version] }
+                      "Version"        => custom_options[:api_version] || @params[:api_version] }
       service_hash.merge!(options)
+      service_hash["SecurityToken"] = @params[:token] if @params[:token]
       # Sign request options
-      service_params = signed_service_params(@aws_secret_access_key, service_hash, http_verb, @params[:server], @params[:service])
+      service_params = signed_service_params(@aws_secret_access_key, service_hash, http_verb, @params[:host_to_sign], @params[:service])
       # Use POST if the length of the query string is too large
       # see http://docs.amazonwebservices.com/AmazonSimpleDB/2007-11-07/DeveloperGuide/MakingRESTRequests.html
       if http_verb != 'POST' && service_params.size > 2000
         http_verb = 'POST'
         if signature_version == '2'
-          service_params = signed_service_params(@aws_secret_access_key, service_hash, http_verb, @params[:server], @params[:service])
+          service_params = signed_service_params(@aws_secret_access_key, service_hash, http_verb, @params[:host_to_sign], @params[:service])
         end
       end
       # create a request
@@ -614,10 +637,11 @@ module RightAws
     #     "Filter.2.Value.2"=>"bb"}
     def amazonize_list(masks, list, options={}) #:nodoc:
       groups = {}
-      Array(list).each_with_index do |list_item, i|
+      list_idx = options[:index] || 1
+      Array(list).each do |list_item|
         Array(masks).each_with_index do |mask, mask_idx|
           key = mask[/\?/] ? mask.dup : mask.dup + '.?'
-          key.sub!('?', (i+1).to_s)
+          key.sub!('?', list_idx.to_s)
           value = Array(list_item)[mask_idx]
           if value.is_a?(Array)
             groups.merge!(amazonize_list(key, value, options))
@@ -633,6 +657,7 @@ module RightAws
             groups[key] = value
           end
         end
+        list_idx += 1
       end
       groups
     end
@@ -662,6 +687,162 @@ module RightAws
       result
     end
 
+    # Build API request keys set.
+    #
+    # Options is a hash, expectations is a set of keys [and rules] how to represent options.
+    # Mappings is an Array (may include hashes) or a Hash.
+    #
+    #  Example:
+    #
+    #  options = { :valid_from              => Time.now - 10,
+    #              :instance_count          => 3,
+    #              :image_id                => 'ami-08f41161',
+    #              :spot_price              => 0.059,
+    #              :instance_type           => 'c1.medium',
+    #              :instance_count          => 1,
+    #              :key_name                => 'tim',
+    #              :availability_zone       => 'us-east-1a',
+    #              :monitoring_enabled      => true,
+    #              :launch_group            => 'lg1',
+    #              :availability_zone_group => 'azg1',
+    #              :groups                  => ['a', 'b', 'c'],
+    #              :group_ids               => 'sg-1',
+    #              :user_data               => 'konstantin',
+    #              :block_device_mappings   => [ { :device_name     => '/dev/sdk',
+    #                                              :ebs_snapshot_id => 'snap-145cbc7d',
+    #                                              :ebs_delete_on_termination => true,
+    #                                              :ebs_volume_size => 3,
+    #                                              :virtual_name => 'ephemeral2' }]}
+    #  mappings = { :spot_price,
+    #               :availability_zone_group,
+    #               :launch_group,
+    #               :type,
+    #               :instance_count,
+    #               :image_id              => 'LaunchSpecification.ImageId',
+    #               :instance_type         => 'LaunchSpecification.InstanceType',
+    #               :key_name              => 'LaunchSpecification.KeyName',
+    #               :addressing_type       => 'LaunchSpecification.AddressingType',
+    #               :kernel_id             => 'LaunchSpecification.KernelId',
+    #               :ramdisk_id            => 'LaunchSpecification.RamdiskId',
+    #               :subnet_id             => 'LaunchSpecification.SubnetId',
+    #               :availability_zone     => 'LaunchSpecification.Placement.AvailabilityZone',
+    #               :monitoring_enabled    => 'LaunchSpecification.Monitoring.Enabled',
+    #               :valid_from            => { :value => Proc.new { !options[:valid_from].right_blank?  && AwsUtils::utc_iso8601(options[:valid_from]) }},
+    #               :valid_until           => { :value => Proc.new { !options[:valid_until].right_blank? && AwsUtils::utc_iso8601(options[:valid_until]) }},
+    #               :user_data             => { :name  => 'LaunchSpecification.UserData',
+    #                                           :value => Proc.new { !options[:user_data].right_blank? && Base64.encode64(options[:user_data]).delete("\n") }},
+    #               :groups                => { :amazonize_list => 'LaunchSpecification.SecurityGroup'},
+    #               :group_ids             => { :amazonize_list => 'LaunchSpecification.SecurityGroupId'},
+    #               :block_device_mappings => { :amazonize_bdm  => 'LaunchSpecification.BlockDeviceMapping'})
+    #
+    #  map_api_keys_and_values( options, mappings) #=>
+    #    {"LaunchSpecification.BlockDeviceMapping.1.Ebs.DeleteOnTermination" => true,
+    #     "LaunchSpecification.BlockDeviceMapping.1.VirtualName"             => "ephemeral2",
+    #     "LaunchSpecification.BlockDeviceMapping.1.Ebs.VolumeSize"          => 3,
+    #     "LaunchSpecification.BlockDeviceMapping.1.Ebs.SnapshotId"          => "snap-145cbc7d",
+    #     "LaunchSpecification.BlockDeviceMapping.1.DeviceName"              => "/dev/sdk",
+    #     "LaunchSpecification.SecurityGroupId.1"                            => "sg-1",
+    #     "LaunchSpecification.InstanceType"                                 => "c1.medium",
+    #     "LaunchSpecification.KeyName"                                      => "tim",
+    #     "LaunchSpecification.ImageId"                                      => "ami-08f41161",
+    #     "LaunchSpecification.SecurityGroup.1"                              => "a",
+    #     "LaunchSpecification.SecurityGroup.2"                              => "b",
+    #     "LaunchSpecification.SecurityGroup.3"                              => "c",
+    #     "LaunchSpecification.Placement.AvailabilityZone"                   => "us-east-1a",
+    #     "LaunchSpecification.Monitoring.Enabled"                           => true,
+    #     "LaunchGroup"                                                      => "lg1",
+    #     "InstanceCount"                                                    => 1,
+    #     "SpotPrice"                                                        => 0.059,
+    #     "AvailabilityZoneGroup"                                            => "azg1",
+    #     "ValidFrom"                                                        => "2011-06-30T08:06:30.000Z",
+    #     "LaunchSpecification.UserData"                                     => "a29uc3RhbnRpbg=="}
+    #
+    def map_api_keys_and_values(options, *mappings) # :nodoc:
+      result = {}
+      vars   = {}
+      # Fix inputs and make them all to be hashes
+      mappings.flatten.each do |mapping|
+        unless mapping.is_a?(Hash)
+          # mapping is just a :key_name
+          mapping = { mapping => { :name  => mapping.to_s.right_camelize, :value => options[mapping] }}
+        else
+          mapping.each do |local_key, api_opts|
+            unless api_opts.is_a?(Hash)
+              # mapping is a { :key_name => 'ApiKeyName' }
+              mapping[local_key] = { :name  => api_opts.to_s, :value => options[local_key]}
+            else
+              # mapping is a { :key_name => { :name => 'ApiKeyName', :value => 'Value', ... etc}  }
+              api_opts[:name]  = local_key.to_s.right_camelize if (api_opts.keys & [:name, :amazonize_list, :amazonize_bdm]).right_blank?
+              api_opts[:value] = options[local_key] unless api_opts.has_key?(:value)
+            end
+          end
+        end
+        vars.merge! mapping
+      end
+      # Build API keys set
+      #  vars now is a Hash:
+      #    { :key1 => { :name           => 'ApiKey1',   :value => 'BlahBlah'},
+      #      :key2 => { :amazonize_list => 'ApiKey2.?', :value => [1, ...] },
+      #      :key3 => { :amazonize_bdm  => 'BDM',       :value => [{..}, ...] }, ... }
+      #
+      vars.each do |local_key, api_opts|
+        if api_opts[:amazonize_list]
+          result.merge!(amazonize_list( api_opts[:amazonize_list], api_opts[:value] )) unless api_opts[:value].right_blank?
+        elsif api_opts[:amazonize_bdm]
+          result.merge!(amazonize_block_device_mappings( api_opts[:value], api_opts[:amazonize_bdm] )) unless api_opts[:value].right_blank?
+        else
+          api_key = api_opts[:name]
+          value   = api_opts[:value]
+          value   = value.call if value.is_a?(Proc)
+          next if value.right_blank?
+          result[api_key] = value
+        end
+      end
+      #
+      result
+    end
+
+    # Transform a hash of parameters into a hash suitable for sending
+    # to Amazon using a key mapping.
+    #
+    #  amazonize_hash_with_key_mapping('Group.Filter',
+    #    {:some_param => 'SomeParam'},
+    #    {:some_param => 'value'}) #=> {'Group.Filter.SomeParam' => 'value'}
+    #
+    def amazonize_hash_with_key_mapping(key, mapping, hash, options={})
+      result = {}
+      unless hash.right_blank?
+        mapping.each do |local_name, remote_name|
+          value = hash[local_name]
+          next if value.nil?
+          result["#{key}.#{remote_name}"] = value
+        end
+      end
+      result
+    end
+
+    # Transform a list of hashes of parameters into a hash suitable for sending
+    # to Amazon using a key mapping.
+    #
+    #  amazonize_list_with_key_mapping('Group.Filter',
+    #    [{:some_param => 'SomeParam'}, {:some_param => 'SomeParam'}],
+    #    {:some_param => 'value'}) #=>
+    #      {'Group.Filter.1.SomeParam' => 'value',
+    #       'Group.Filter.2.SomeParam' => 'value'}
+    #
+    def amazonize_list_with_key_mapping(key, mapping, list, options={})
+      result = {}
+      unless list.right_blank?
+        list.each_with_index do |item, index|
+          mapping.each do |local_name, remote_name|
+            value = item[local_name]
+            next if value.nil?
+            result["#{key}.#{index+1}.#{remote_name}"] = value
+          end
+        end
+      end
+    end
+    
     # Execute a block of code with custom set of settings for right_http_connection.
     # Accepts next options (see Rightscale::HttpConnection for explanation):
     #  :raise_on_timeout
@@ -926,19 +1107,21 @@ module RightAws
             sleep @reiteration_delay 
             @reiteration_delay *= 2
 
-            # Always make sure that the fp is set to point to the beginning(?)
-            # of the File/IO. TODO: it assumes that offset is 0, which is bad.
-            if(request[:request].body_stream && request[:request].body_stream.respond_to?(:pos))
-              begin
-                request[:request].body_stream.pos = 0
-              rescue Exception => e
-                @logger.warn("Retry may fail due to unable to reset the file pointer" +
-                             " -- #{self.class.name} : #{e.inspect}")
-              end
-            end
           else
             @aws.logger.info("##### Retry ##{@retries} is being performed due to a redirect.  ####")
           end
+
+          # Always make sure that the fp is set to point to the beginning(?)
+          # of the File/IO. TODO: it assumes that offset is 0, which is bad.
+          if(request[:request].body_stream && request[:request].body_stream.respond_to?(:pos))
+            begin
+              request[:request].body_stream.pos = 0
+            rescue Exception => e
+              @logger.warn("Retry may fail due to unable to reset the file pointer" +
+                           " -- #{self.class.name} : #{e.inspect}")
+            end
+          end
+
           result = @aws.request_info(request, @parser)
         else
           @aws.logger.warn("##### Ooops, time is over... ####")

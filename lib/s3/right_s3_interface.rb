@@ -26,6 +26,8 @@ module RightAws
   class S3Interface < RightAwsBase
     
     USE_100_CONTINUE_PUT_SIZE = 1_000_000
+    MINIMUM_PART_SIZE         = 5 * 1024 * 1024
+    DEFAULT_RETRY_COUNT       = 5
     
     include RightAwsBaseInterface
     
@@ -38,7 +40,25 @@ module RightAws
     ONE_YEAR_IN_SECONDS    = 365 * 24 * 60 * 60
     AMAZON_HEADER_PREFIX   = 'x-amz-'
     AMAZON_METADATA_PREFIX = 'x-amz-meta-'
+    S3_REQUEST_PARAMETERS = [ 'acl',
+        'location',
+        'logging', # this one is beta, no support for now
+        'partNumber',
+        'response-content-type',
+        'response-content-language',
+        'response-expires',
+        'response-cache-control',
+        'response-content-disposition',
+        'response-content-encoding',
+        'torrent',
+        'uploadId',
+        'uploads',
+        'delete',
+        'versions',
+        'versioning'].sort
+    MULTI_OBJECT_DELETE_MAX_KEYS = 1000
 
+    
     @@bench = AwsBenchmarkingBlock.new
     def self.bench_xml
       @@bench.xml
@@ -67,10 +87,11 @@ module RightAws
       #  
       # Params is a hash:
       #
-      #    {:server       => 's3.amazonaws.com'   # Amazon service host: 's3.amazonaws.com'(default)
-      #     :port         => 443                  # Amazon service port: 80 or 443(default)
-      #     :protocol     => 'https'              # Amazon service protocol: 'http' or 'https'(default)
-      #     :logger       => Logger Object}       # Logger instance: logs to STDOUT if omitted }
+      #    {:server        => 's3.amazonaws.com'   # Amazon service host: 's3.amazonaws.com'(default)
+      #     :port          => 443                  # Amazon service port: 80 or 443(default)
+      #     :protocol      => 'https'              # Amazon service protocol: 'http' or 'https'(default)
+      #     :logger        => Logger Object        # Logger instance: logs to STDOUT if omitted
+      #     :no_subdomains => true}                # Force placing bucket name into path instead of domain name
       #
     def initialize(aws_access_key_id=nil, aws_secret_access_key=nil, params={})
       init({ :name             => 'S3', 
@@ -107,15 +128,20 @@ module RightAws
       s3_headers.sort { |a, b| a[0] <=> b[0] }.each do |key, value|
         out_string << (key[/^#{AMAZON_HEADER_PREFIX}/o] ? "#{key}:#{value}\n" : "#{value}\n")
       end
-        # ignore everything after the question mark...
+      # ignore everything after the question mark by default...
       out_string << path.gsub(/\?.*$/, '')
-       # ...unless there is an acl or torrent parameter
-      out_string << '?acl'      if path[/[&?]acl($|&|=)/]
-      out_string << '?torrent'  if path[/[&?]torrent($|&|=)/]
-      out_string << '?location' if path[/[&?]location($|&|=)/]
-      out_string << '?logging'  if path[/[&?]logging($|&|=)/]  # this one is beta, no support for now
-      out_string << '?versions' if path[/[&?]versions($|&|=)/] 
-      out_string << '?versioning' if path[/[&?]versioning($|&|=)/] 
+      # ... unless there is a parameter that we care about.
+      S3_REQUEST_PARAMETERS.each do |parameter|
+        if path[/[&?]#{parameter}(=[^&]*)?($|&)/]
+          if $1
+            value = CGI::unescape($1)
+          else
+            value = ''
+          end
+          out_string << (out_string[/[?]/] ? "&#{parameter}#{value}" : "?#{parameter}#{value}")
+        end
+      end
+
       out_string
     end
 
@@ -137,6 +163,7 @@ module RightAws
       # extract bucket name and check it's dns compartibility
       headers[:url].to_s[%r{^([a-z0-9._-]*)(/[^?]*)?(\?.+)?}i]
       bucket_name, key_path, params_list = $1, $2, $3
+      key_path = key_path.gsub( '%2F', '/' ) if key_path
       # select request model
       if !param(:no_subdomains) && is_dns_bucket?(bucket_name)
         # fix a path
@@ -157,8 +184,8 @@ module RightAws
         # calculate request data
       server, path, path_to_sign = fetch_request_params(headers)
       data = headers[:data]
-        # remove unset(==optional) and symbolyc keys
-      headers.each{ |key, value| headers.delete(key) if (value.nil? || key.is_a?(Symbol)) }
+        # make sure headers are downcased strings
+      headers = AwsUtils::fix_headers(headers)
         #
       headers['content-type'] ||= ''
       headers['date']           = Time.now.httpdate
@@ -451,7 +478,7 @@ module RightAws
       # mode.
       #
       
-    def put(bucket, key, data=nil, headers={})
+    def put(bucket, key, data=nil, headers={}, &blck)
       # On Windows, if someone opens a file in text mode, we must reset it so
       # to binary mode for streaming to work properly
       if(data.respond_to?(:binmode))
@@ -462,7 +489,7 @@ module RightAws
         headers['expect'] = '100-continue'
       end
       req_hash = generate_rest_request('PUT', headers.merge(:url=>"#{bucket}/#{CGI::escape key}", :data=>data))
-      request_info(req_hash, RightHttp2xxParser.new)
+      request_info(req_hash, RightHttp2xxParser.new, &blck)
     rescue
       on_exception
     end
@@ -547,6 +574,134 @@ module RightAws
       r[:verified_md5] ? (return r) : (raise AwsError.new("Uploaded object failed MD5 checksum verification: #{r.inspect}"))
     end
     
+    # New experimental API for uploading objects using the multipart upload API.
+    # store_object_multipart is similar in function to the store_object method, but breaks the input into parts and transmits each
+    # part separately.  The multipart upload API has the benefit of being be able to retransmit a part in isolation without needing to
+    # restart the entire upload.  This makes it ideal for uploading large files over unreliable networks.  It also does not
+    # require the file size to be known before starting the upload, making it useful for stream data as it is created (say via reading a pipe or socket).
+    # The hash of the response headers contains useful information like the location (the URI for the newly created object), bucket, key, and etag).
+    #
+    # The optional argument of :headers allows the caller to specify arbitrary request header values.
+    #
+    # s3.store_object_multipart(:bucket => "foobucket", :key => "foo", :data => "polemonium" )
+    #   => {:location=>"https://s3.amazonaws.com/right_s3_awesome_test_bucket_000B1_officedrop/test%2Flarge_multipart_file",
+    #       :e_tag=>"\"72b81ac08aed4d4d1055c11f56c2a258-1\"",
+    #       :key=>"test/large_multipart_file",
+    #       :bucket=>"right_s3_awesome_test_bucket_000B1_officedrop"}
+    #
+    # f = File.new("some_file", "r")
+    # s3.store_object_multipart(:bucket => "foobucket", :key => "foo", :data => f )
+    #   => {:location=>"https://s3.amazonaws.com/right_s3_awesome_test_bucket_000B1_officedrop/test%2Flarge_multipart_file",
+    #       :e_tag=>"\"72b81ac08aed4d4d1055c11f56c2a258-1\"",
+    #       :key=>"test/large_multipart_file",
+    #       :bucket=>"right_s3_awesome_test_bucket_000B1_officedrop"}
+    def store_object_multipart(params)
+      AwsUtils.allow_only([:bucket, :key, :data, :headers, :part_size, :retry_count], params)
+      AwsUtils.mandatory_arguments([:bucket, :key, :data], params)
+      params[:headers] = {} unless params[:headers]
+
+      params[:data].binmode if(params[:data].respond_to?(:binmode)) # On Windows, if someone opens a file in text mode, we must reset it to binary mode for streaming to work properly
+
+      # detect whether we are using straight read or converting to string first
+      unless(params[:data].respond_to?(:read))
+        params[:data] = StringIO.new(params[:data].to_s)
+      end
+
+      # make sure part size is > 5 MB minimum
+      params[:part_size] ||= MINIMUM_PART_SIZE
+      if params[:part_size] < MINIMUM_PART_SIZE
+        raise AwsError.new("Part size for a multipart upload must be greater than or equal to #{5 * 1024 * 1024} bytes.  #{params[:part_size]} bytes was provided.")
+      end
+
+      # make sure retry_count is positive
+      params[:retry_count] ||= DEFAULT_RETRY_COUNT
+      if params[:retry_count] < 0
+        raise AwsError.new("Retry count must be positive.  #{params[:retry_count]} bytes was provided.")
+      end
+
+      # Set 100-continue for large part sizes
+      if (params[:part_size] >= USE_100_CONTINUE_PUT_SIZE)
+        params[:headers]['expect'] = '100-continue'
+      end
+
+      # initiate upload
+      initiate_hash = generate_rest_request('POST', params[:headers].merge(:url=>"#{params[:bucket]}/#{CGI::escape params[:key]}?uploads"))
+      initiate_resp = request_info(initiate_hash, S3MultipartUploadInitiateResponseParser.new)
+      upload_id = initiate_resp[:upload_id]
+
+      # split into parts and upload each one, re-trying if necessary
+      #   upload occurs serially at this time.
+      part_etags = []
+      part_data = ""
+      index = 1
+      until params[:data].eof?
+        part_data = params[:data].read(params[:part_size])
+        unless part_data.size == 0
+          retry_attempts = 1
+          while true
+            begin
+              send_part_hash = generate_rest_request('PUT', params[:headers].merge({ :url=>"#{params[:bucket]}/#{CGI::escape params[:key]}?partNumber=#{index}&uploadId=#{upload_id}", :data=>part_data } ))
+              send_part_resp = request_info(send_part_hash, S3HttpResponseHeadParser.new)
+              part_etags << {:part_num => index, :etag => send_part_resp['etag']}
+              index += 1
+              break # successful, can move to next part
+            rescue AwsError => e
+              if retry_attempts >= params[:retry_count]
+                raise e
+              else
+                #Hit an error attempting to transmit part, retry until retry_attemts have been exhausted
+                retry_attempts += 1
+              end
+            end
+          end
+        end
+      end
+
+      # assemble complete upload message
+      complete_body = "<CompleteMultipartUpload>"
+      part_etags.each do |part_hash|
+        complete_body << "<Part><PartNumber>#{part_hash[:part_num]}</PartNumber><ETag>#{part_hash[:etag]}</ETag></Part>"
+      end
+      complete_body << "</CompleteMultipartUpload>"
+      complete_req_hash = generate_rest_request('POST', {:url=>"#{params[:bucket]}/#{CGI::escape params[:key]}?uploadId=#{upload_id}", :data => complete_body})
+      return request_info(complete_req_hash, S3CompleteMultipartParser.new)
+    rescue
+      on_exception
+    end
+
+    class S3MultipartUploadInitiateResponseParser < RightAWSParser
+      def reset
+        @result = {}
+      end
+      def headers_to_string(headers)
+        result = {}
+        headers.each do |key, value|
+          value       = value.first if value.is_a?(Array) && value.size<2
+          result[key] = value
+        end
+        result
+      end
+      def tagend(name)
+        case name
+          when 'UploadId'          then @result[:upload_id] = @text
+        end
+      end
+    end
+
+    class S3CompleteMultipartParser < RightAWSParser  # :nodoc:
+      def reset
+        @result = {}
+      end
+      def tagend(name)
+        case name
+          when 'Location' then @result[:location] = @text
+          when 'Bucket'   then @result[:bucket]   = @text
+          when 'Key'      then @result[:key]      = @text
+          when 'ETag'     then @result[:e_tag]    = @text
+        end
+      end
+    end
+
       # Retrieves object data from Amazon. Returns a +hash+  or an exception.
       #
       #  s3.get('my_awesome_bucket', 'log/curent/1.log') #=>
@@ -674,6 +829,34 @@ module RightAws
     def delete(bucket, key='', headers={})
       req_hash = generate_rest_request('DELETE', headers.merge(:url=>"#{bucket}/#{CGI::escape key}"))
       request_info(req_hash, RightHttp2xxParser.new)
+    rescue
+      on_exception
+    end
+
+    # Deletes multiple keys. Returns an array with errors, if any.
+    #
+    #  s3.delete_multiple('my_awesome_bucket', ['key1', 'key2', ...)
+    #    #=> [ { :key => 'key2', :code => 'AccessDenied', :message => "Access Denied" } ]
+    #
+    def delete_multiple(bucket, keys=[], headers={})
+      errors = []
+      keys = Array.new(keys)
+      while keys.length > 0
+        data = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        data += "<Delete>\n<Quiet>true</Quiet>\n"
+        keys.take(MULTI_OBJECT_DELETE_MAX_KEYS).each do |key|
+          data += "<Object><Key>#{AwsUtils::xml_escape(key)}</Key></Object>\n"
+        end
+        data += "</Delete>"
+        req_hash = generate_rest_request('POST', headers.merge(
+          :url  => "#{bucket}?delete",
+          :data => data,
+          'content-md5' => AwsUtils::content_md5(data)
+        ))
+        errors += request_info(req_hash, S3DeleteMultipleParser.new)
+        keys = keys.drop(MULTI_OBJECT_DELETE_MAX_KEYS)
+      end
+      errors
     rescue
       on_exception
     end
@@ -875,19 +1058,25 @@ module RightAws
     #      Query API: Links
     #-----------------------------------------------------------------
 
+    def s3_link_escape(text)
+      #CGI::escape(text.to_s).gsub(/[+]/, '%20')
+      AwsUtils::amz_escape(text.to_s)
+    end
+    
       # Generates link for QUERY API
     def generate_link(method, headers={}, expires=nil) #:nodoc:
         # calculate request data
       server, path, path_to_sign = fetch_request_params(headers)
+
         # expiration time
       expires ||= DEFAULT_EXPIRES_AFTER
       expires   = Time.now.utc + expires if expires.is_a?(Fixnum) && (expires < ONE_YEAR_IN_SECONDS)
       expires   = expires.to_i
-        # remove unset(==optional) and symbolyc keys
-      headers.each{ |key, value| headers.delete(key) if (value.nil? || key.is_a?(Symbol)) }
+        # make sure headers are downcased strings
+      headers = AwsUtils::fix_headers(headers)
         #generate auth strings
       auth_string = canonical_string(method, path_to_sign, headers, expires)
-      signature   = CGI::escape(Base64.encode64(OpenSSL::HMAC.digest(OpenSSL::Digest::Digest.new("sha1"), @aws_secret_access_key, auth_string)).strip)
+      signature   = CGI::escape(AwsUtils::sign( @aws_secret_access_key, auth_string))
         # path building
       addon = "Signature=#{signature}&Expires=#{expires}&AWSAccessKeyId=#{@aws_access_key_id}"
       path += path[/\?/] ? "&#{addon}" : "?#{addon}"
@@ -931,7 +1120,7 @@ module RightAws
       #  s3.list_bucket_link('my_awesome_bucket') #=> url string
       #
     def list_bucket_link(bucket, options=nil, expires=nil, headers={})
-      bucket += '?' + options.map{|k, v| "#{k.to_s}=#{CGI::escape v.to_s}"}.join('&') unless options.right_blank?
+      bucket += '?' + options.map{|k, v| "#{k.to_s}=#{s3_link_escape(v)}"}.join('&') unless options.right_blank?
       generate_link('GET', headers.merge(:url=>bucket), expires)
     rescue
       on_exception
@@ -942,7 +1131,7 @@ module RightAws
       #  s3.put_link('my_awesome_bucket',key, object) #=> url string
       #
     def put_link(bucket, key, data=nil, expires=nil, headers={})
-      generate_link('PUT', headers.merge(:url=>"#{bucket}/#{CGI::escape key}", :data=>data), expires)
+      generate_link('PUT', headers.merge(:url=>"#{bucket}/#{s3_link_escape(key)}", :data=>data), expires)
     rescue
       on_exception
     end
@@ -959,8 +1148,20 @@ module RightAws
       #  s3.get_link('my_awesome_bucket',key) #=> https://s3.amazonaws.com:443/my_awesome_bucket/asia%2Fcustomers?Signature=QAO...
       #
       # see http://docs.amazonwebservices.com/AmazonS3/2006-03-01/VirtualHosting.html
-    def get_link(bucket, key, expires=nil, headers={})
-      generate_link('GET', headers.merge(:url=>"#{bucket}/#{CGI::escape key}"), expires)
+      #
+      # To specify +response+-* parameters, define them in the response_params hash:
+      #
+      #  s3.get_link('my_awesome_bucket',key,nil,{},{ "response-content-disposition" => "attachment; filename=caf�.png", "response-content-type" => "image/png"})
+      #
+      #    #=> https://s3.amazonaws.com:443/my_awesome_bucket/asia%2Fcustomers?response-content-disposition=attachment%3B%20filename%3Dcaf%25C3%25A9.png&response-content-type=image%2Fpng&Signature=wio...
+      #
+    def get_link(bucket, key, expires=nil, headers={}, response_params={})
+      if response_params.size > 0
+        response_params = '?' + response_params.map { |k, v| "#{k}=#{s3_link_escape(v)}" }.join('&')
+      else
+        response_params = ''
+      end
+      generate_link('GET', headers.merge(:url=>"#{bucket}/#{s3_link_escape(key)}#{response_params}"), expires)
     rescue
       on_exception
     end
@@ -970,7 +1171,7 @@ module RightAws
       #  s3.head_link('my_awesome_bucket',key) #=> url string
       #
     def head_link(bucket, key, expires=nil,  headers={})
-      generate_link('HEAD', headers.merge(:url=>"#{bucket}/#{CGI::escape key}"), expires)
+      generate_link('HEAD', headers.merge(:url=>"#{bucket}/#{s3_link_escape(key)}"), expires)
     rescue
       on_exception
     end
@@ -980,7 +1181,7 @@ module RightAws
       #  s3.delete_link('my_awesome_bucket',key) #=> url string
       #
     def delete_link(bucket, key, expires=nil, headers={})
-      generate_link('DELETE', headers.merge(:url=>"#{bucket}/#{CGI::escape key}"), expires)
+      generate_link('DELETE', headers.merge(:url=>"#{bucket}/#{s3_link_escape(key)}"), expires)
     rescue
       on_exception
     end
@@ -991,7 +1192,7 @@ module RightAws
       #  s3.get_acl_link('my_awesome_bucket',key) #=> url string
       #
     def get_acl_link(bucket, key='', headers={})
-      return generate_link('GET', headers.merge(:url=>"#{bucket}/#{CGI::escape key}?acl"))
+      return generate_link('GET', headers.merge(:url=>"#{bucket}/#{s3_link_escape(key)}?acl"))
     rescue
       on_exception
     end
@@ -1001,7 +1202,7 @@ module RightAws
       #  s3.put_acl_link('my_awesome_bucket',key) #=> url string
       #
     def put_acl_link(bucket, key='', headers={})
-      return generate_link('PUT', headers.merge(:url=>"#{bucket}/#{CGI::escape key}?acl"))
+      return generate_link('PUT', headers.merge(:url=>"#{bucket}/#{s3_link_escape(key)}?acl"))
     rescue
       on_exception
     end
@@ -1024,6 +1225,23 @@ module RightAws
       return put_acl_link(bucket, '', acl_xml_doc, headers)
     rescue
       on_exception
+    end
+
+    class S3DeleteMultipleParser < RightAWSParser # :nodoc:
+      def reset
+        @result = []
+      end
+      def tagstart(name, attributes)
+        @error = {} if name == 'Error'
+      end
+      def tagend(name)
+        case name
+          when 'Key'     then @error[:key]     = @text
+          when 'Code'    then @error[:code]    = @text
+          when 'Message' then @error[:message] = @text
+          when 'Error'   then @result << @error
+        end
+      end
     end
 
     #-----------------------------------------------------------------
@@ -1232,7 +1450,7 @@ module RightAws
       def headers_to_string(headers)
         result = {}
         headers.each do |key, value|
-          value       = value.to_s if value.is_a?(Array) && value.size<2
+          value       = value.first if value.is_a?(Array) && value.size<2
           result[key] = value
         end
         result
